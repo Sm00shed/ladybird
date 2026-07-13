@@ -1495,7 +1495,7 @@ private:
 - (BOOL)windowShouldClose:(NSWindow*)sender
 {
     auto* delegate = (ApplicationDelegate*)[NSApp delegate];
-    auto confirm_canceling_downloads = [&]() {
+    auto confirm_canceling_downloads = [&]() -> bool {
         if ([delegate tabCount] > 1)
             return true;
         return [(Application*)NSApp confirmCancelActiveDownloads];
