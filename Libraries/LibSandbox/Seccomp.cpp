@@ -59,6 +59,7 @@ static constexpr unsigned read_only_open_flags = O_CLOEXEC;
 #define SECCOMP_TRAP BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP)
 #define SECCOMP_ERRNO(error) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ((error) & SECCOMP_RET_DATA))
 #define SECCOMP_ALLOW_NOTHING BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0)
+#define SECCOMP_TRAP_WITH_DATA(data) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | ((data) & SECCOMP_RET_DATA))
 #define SECCOMP_APPEND_ALLOW_SYSCALL(policy, name)                               \
     do {                                                                         \
         (policy).append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_##name, 0, 1)); \
@@ -701,10 +702,52 @@ static char const* syscall_name(long syscall_number)
 
 #undef CASE_SYSCALL_NAME
 
+static constexpr unsigned emulate_fstatat_trap_data = 1;
+
 static char s_process_name[16] = "unknown";
+
+static bool emulate_fstatat(void* context)
+{
+#if defined(__NR_newfstatat) && defined(__NR_fstat) && (defined(__x86_64__) || defined(__aarch64__))
+    auto* machine_context = &static_cast<ucontext_t*>(context)->uc_mcontext;
+
+#    if defined(__x86_64__)
+    auto fd = static_cast<int>(machine_context->gregs[REG_RDI]);
+    auto const* path = reinterpret_cast<char const*>(machine_context->gregs[REG_RSI]);
+    auto buffer = static_cast<FlatPtr>(machine_context->gregs[REG_RDX]);
+    auto flags = static_cast<int>(machine_context->gregs[REG_R10]);
+#    else
+    auto fd = static_cast<int>(machine_context->regs[0]);
+    auto const* path = reinterpret_cast<char const*>(machine_context->regs[1]);
+    auto buffer = static_cast<FlatPtr>(machine_context->regs[2]);
+    auto flags = static_cast<int>(machine_context->regs[3]);
+#    endif
+
+    if (flags != AT_EMPTY_PATH || path == nullptr || path[0] != '\0')
+        return false;
+    auto saved_errno = errno;
+    auto result = syscall(__NR_fstat, fd, buffer);
+    if (result < 0)
+        result = -errno;
+    errno = saved_errno;
+
+#    if defined(__x86_64__)
+    machine_context->gregs[REG_RAX] = static_cast<greg_t>(result);
+#    else
+    machine_context->regs[0] = static_cast<unsigned long long>(result);
+#    endif
+    return true;
+#else
+    (void)context;
+    return false;
+#endif
+}
 
 static void handle_sigsys(int, siginfo_t* info, void* context)
 {
+    if (static_cast<unsigned>(info->si_errno) == emulate_fstatat_trap_data && emulate_fstatat(context))
+        return;
+
     write_string("Sandbox violation in ");
     write_string(s_process_name);
     write_string(": disallowed syscall ");
@@ -913,6 +956,10 @@ void SeccompPolicy::allow_file_descriptor_operations()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, write);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, close);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fstat);
+#ifdef __NR_newfstatat
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat, 0, 1));
+    append(SECCOMP_TRAP_WITH_DATA(emulate_fstatat_trap_data));
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup);
 #ifdef __NR_dup2
     SECCOMP_APPEND_ALLOW_SYSCALL(*this, dup2);
